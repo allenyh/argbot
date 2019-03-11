@@ -28,44 +28,34 @@ class Robot_PID():
 		self.pos_ctrl_min = 0
 		self.ang_ctrl_max = 1.0
 		self.ang_ctrl_min = -1.0
-		self.pos_station_max = 0.5
-		self.pos_station_min = -0.5
 		self.turn_threshold = 20
 		self.cmd_ctrl_max = 0.7
 		self.cmd_ctrl_min = -0.7
-		self.station_keeping_dis = 0.5 # meters
+		self.arrived_dis = 0.5 # meters
 		self.frame_id = 'map'
-		self.is_station_keeping = False
-		self.stop_pos = []
+		self.emergency_stop = False
 		self.final_goal = None # The final goal that you want to arrive
 		self.goal = self.final_goal
 
 		rospy.loginfo("[%s] Initializing " %(self.node_name))
 
-		self.sub_goal = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.goal_cb, queue_size=1)
+		self.sub_goal = rospy.Subscriber("/pursue_point", PoseStamped, self.goal_cb, queue_size=1)
 		rospy.Subscriber('/odometry/ground_truth', Odometry, self.odom_cb, queue_size = 1, buff_size = 2**24)
 		self.pub_cmd = rospy.Publisher("/X1/cmd_vel", Twist, queue_size = 1)
 		self.pub_goal = rospy.Publisher("/goal_point", Marker, queue_size = 1)
-		self.station_keeping_srv = rospy.Service("/station_keeping", SetBool, self.station_keeping_cb)
+		self.emergency_stop_srv = rospy.Service("/emergency_stop", SetBool, self.emergency_stop_cb)
 
 		self.pos_control = PID_control("Position")
 		self.ang_control = PID_control("Angular")
 
-		self.ang_station_control = PID_control("Angular_station")
-		self.pos_station_control = PID_control("Position_station")
-
 		self.pos_srv = Server(pos_PIDConfig, self.pos_pid_cb, "Position")
 		self.ang_srv = Server(ang_PIDConfig, self.ang_pid_cb, "Angular")
-		self.pos_station_srv = Server(pos_PIDConfig, self.pos_station_pid_cb, "Angular_station")
-		self.ang_station_srv = Server(ang_PIDConfig, self.ang_station_pid_cb, "Position_station")
 		
 		self.initialize_PID()
 
 	def odom_cb(self, msg):
 		self.frame_id = msg.header.frame_id
 		robot_position = [msg.pose.pose.position.x, msg.pose.pose.position.y]
-		if not self.is_station_keeping:
-			self.stop_pos = [msg.pose.pose.position.x, msg.pose.pose.position.y]
 		quat = (msg.pose.pose.orientation.x,\
 				msg.pose.pose.orientation.y,\
 				msg.pose.pose.orientation.z,\
@@ -78,10 +68,9 @@ class Robot_PID():
 		#yaw = yaw + np.pi/2
 		goal_distance = self.get_distance(robot_position, self.goal)
 		goal_angle = self.get_goal_angle(yaw, robot_position, self.goal)
-		
-		if goal_distance < self.station_keeping_dis or self.is_station_keeping:
-			rospy.loginfo("Station Keeping")
-			pos_output, ang_output = self.station_keeping(goal_distance, goal_angle)
+		if goal_distance < self.arrived_dis or self.emergency_stop:
+			rospy.loginfo("Stop!!!")
+			pos_output, ang_output = (0, 0)
 		else:
 			pos_output, ang_output = self.control(goal_distance, goal_angle)
 		
@@ -99,39 +88,21 @@ class Robot_PID():
 		pos_output = self.pos_constrain(-self.pos_control.output/self.dis4constV)
 
 		# -1 = -180/180 < output/180 < 180/180 = 1
-		ang_output = self.ang_constrain(self.ang_control.output*2/180.)
+		ang_output = self.ang_constrain(self.ang_control.output*3/180.)
 		if abs(self.ang_control.output) > self.turn_threshold:
 			if pos_output > 0.1:
 				pos_output = 0.1
-		return pos_output, ang_output
-
-	def station_keeping(self, goal_distance, goal_angle):
-		self.pos_station_control.update(goal_distance)
-		self.ang_station_control.update(goal_angle)
-
-		# pos_output will always be positive
-		pos_output = self.pos_station_constrain(-self.pos_station_control.output/self.dis4constV)
-
-		# -1 = -180/180 < output/180 < 180/180 = 1
-		ang_output = self.ang_station_control.output/180.
-
-		# if the goal is behind the robot
-		if abs(goal_angle) > 90: 
-			pos_output = - pos_output
-			ang_output = - ang_output
 		return pos_output, ang_output
 
 	def goal_cb(self, p):
 		self.final_goal = [p.pose.position.x, p.pose.position.y]
 		self.goal = self.final_goal
 
-	def station_keeping_cb(self, req):
+	def emergency_stop_cb(self, req):
 		if req.data == True:
-			self.goal = self.stop_pos
-			self.is_station_keeping = True
+			self.emergency_stop = True
 		else:
-			self.goal = self.final_goal
-			self.is_station_keeping = False
+			self.emergency_stop = False
 		res = SetBoolResponse()
 		res.success = True
 		res.message = "recieved"
@@ -158,23 +129,12 @@ class Robot_PID():
 			return self.ang_ctrl_min
 		return input
 
-	def pos_station_constrain(self, input):
-		if input > self.pos_station_max:
-			return self.pos_station_max
-		if input < self.pos_station_min:
-			return self.pos_station_min
-		return input
-
 	def initialize_PID(self):
 		self.pos_control.setSampleTime(1)
 		self.ang_control.setSampleTime(1)
-		self.pos_station_control.setSampleTime(1)
-		self.ang_station_control.setSampleTime(1)
 
 		self.pos_control.SetPoint = 0.0
 		self.ang_control.SetPoint = 0.0
-		self.pos_station_control.SetPoint = 0.0
-		self.ang_station_control.SetPoint = 0.0
 
 	def get_goal_angle(self, robot_yaw, robot, goal):
 		robot_angle = np.degrees(robot_yaw)
@@ -240,26 +200,6 @@ class Robot_PID():
 		self.ang_control.setKp(Kp)
 		self.ang_control.setKi(Ki)
 		self.ang_control.setKd(Kd)
-		return config
-
-	def pos_station_pid_cb(self, config, level):
-		print("Position: [Kp]: {Kp}   [Ki]: {Ki}   [Kd]: {Kd}\n".format(**config))
-		Kp = float("{Kp}".format(**config))
-		Ki = float("{Ki}".format(**config))
-		Kd = float("{Kd}".format(**config))
-		self.pos_station_control.setKp(Kp)
-		self.pos_station_control.setKi(Ki)
-		self.pos_station_control.setKd(Kd)
-		return config
-
-	def ang_station_pid_cb(self, config, level):
-		print("Angular: [Kp]: {Kp}   [Ki]: {Ki}   [Kd]: {Kd}\n".format(**config))
-		Kp = float("{Kp}".format(**config))
-		Ki = float("{Ki}".format(**config))
-		Kd = float("{Kd}".format(**config))
-		self.ang_station_control.setKp(Kp)
-		self.ang_station_control.setKi(Ki)
-		self.ang_station_control.setKd(Kd)
 		return config
 
 if __name__ == '__main__':

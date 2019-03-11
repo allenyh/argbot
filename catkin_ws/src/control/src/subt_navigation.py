@@ -11,7 +11,7 @@ from sensor_msgs.msg import Image, LaserScan
 from sensor_msgs.msg import CameraInfo
 from geometry_msgs.msg import PoseArray, Pose, PoseStamped, Point, Twist
 from visualization_msgs.msg import Marker, MarkerArray
-from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry
+from nav_msgs.msg import OccupancyGrid, MapMetaData, Odometry, Path
 import rospkg
 from cv_bridge import CvBridge, CvBridgeError
 from dynamic_reconfigure.server import Server
@@ -19,6 +19,7 @@ from control.cfg import pos_PIDConfig, ang_PIDConfig
 from std_srvs.srv import SetBool, SetBoolResponse
 
 from PID import PID_control
+from pure_pursuit import PurePursuit
 
 class Robot_PID():
 	def __init__(self):
@@ -39,12 +40,14 @@ class Robot_PID():
 		self.stop_pos = []
 		self.final_goal = None # The final goal that you want to arrive
 		self.goal = self.final_goal
+		self.robot_position = None
 
 		rospy.loginfo("[%s] Initializing " %(self.node_name))
-
-		self.sub_goal = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.goal_cb, queue_size=1)
+		self.sub_goal = rospy.Subscriber("/planning_path", Path, self.path_cb, queue_size=1)
+		#self.sub_goal = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.goal_cb, queue_size=1)
 		rospy.Subscriber('/odometry/ground_truth', Odometry, self.odom_cb, queue_size = 1, buff_size = 2**24)
 		self.pub_cmd = rospy.Publisher("/X1/cmd_vel", Twist, queue_size = 1)
+		self.pub_lookahead = rospy.Publisher("/lookahead_point", Marker, queue_size = 1)
 		self.pub_goal = rospy.Publisher("/goal_point", Marker, queue_size = 1)
 		self.station_keeping_srv = rospy.Service("/station_keeping", SetBool, self.station_keeping_cb)
 
@@ -54,6 +57,8 @@ class Robot_PID():
 		self.ang_station_control = PID_control("Angular_station")
 		self.pos_station_control = PID_control("Position_station")
 
+		self.purepursuit = PurePursuit()
+
 		self.pos_srv = Server(pos_PIDConfig, self.pos_pid_cb, "Position")
 		self.ang_srv = Server(ang_PIDConfig, self.ang_pid_cb, "Angular")
 		self.pos_station_srv = Server(pos_PIDConfig, self.pos_station_pid_cb, "Angular_station")
@@ -61,9 +66,19 @@ class Robot_PID():
 		
 		self.initialize_PID()
 
+
+	def path_cb(self, msg):
+		self.final_goal = []
+		for pose in msg.poses:
+			self.final_goal.append([pose.pose.position.x, pose.pose.position.y])
+		self.goal = self.final_goal
+		self.is_station_keeping = False
+		self.start_navigation = True
+		self.purepursuit.set_goal(self.robot_position, self.goal)
+
 	def odom_cb(self, msg):
 		self.frame_id = msg.header.frame_id
-		robot_position = [msg.pose.pose.position.x, msg.pose.pose.position.y]
+		self.robot_position = [msg.pose.pose.position.x, msg.pose.pose.position.y]
 		if not self.is_station_keeping:
 			self.stop_pos = [msg.pose.pose.position.x, msg.pose.pose.position.y]
 		quat = (msg.pose.pose.orientation.x,\
@@ -75,21 +90,31 @@ class Robot_PID():
 		if self.goal is None: # if the robot haven't recieve any goal
 			return
 
-		#yaw = yaw + np.pi/2
-		goal_distance = self.get_distance(robot_position, self.goal)
-		goal_angle = self.get_goal_angle(yaw, robot_position, self.goal)
-		
-		if goal_distance < self.station_keeping_dis or self.is_station_keeping:
-			rospy.loginfo("Station Keeping")
-			pos_output, ang_output = self.station_keeping(goal_distance, goal_angle)
+		reach_goal = self.purepursuit.set_robot_pose(self.robot_position, yaw)
+		pursuit_point = self.purepursuit.get_pursuit_point()
+
+		if reach_goal or reach_goal is None:
+			pos_output, ang_output = 0, 0
 		else:
+			self.publish_lookahead(self.robot_position, pursuit_point)
+			goal_distance = self.get_distance(self.robot_position, pursuit_point)
+			goal_angle = self.get_goal_angle(yaw, self.robot_position, pursuit_point)
 			pos_output, ang_output = self.control(goal_distance, goal_angle)
+		#yaw = yaw + np.pi/2
+		'''goal_distance = self.get_distance(robot_position, self.goal)
+								goal_angle = self.get_goal_angle(yaw, robot_position, self.goal)
+								
+								if goal_distance < self.station_keeping_dis or self.is_station_keeping:
+									rospy.loginfo("Station Keeping")
+									pos_output, ang_output = self.station_keeping(goal_distance, goal_angle)
+								else:
+									pos_output, ang_output = self.control(goal_distance, goal_angle)'''
 		
 		cmd_msg = Twist()
 		cmd_msg.linear.x = pos_output
 		cmd_msg.angular.z = ang_output
 		self.pub_cmd.publish(cmd_msg)
-		self.publish_goal(self.goal)
+		#self.publish_goal(self.goal)
 
 	def control(self, goal_distance, goal_angle):
 		self.pos_control.update(goal_distance)
@@ -120,10 +145,6 @@ class Robot_PID():
 			pos_output = - pos_output
 			ang_output = - ang_output
 		return pos_output, ang_output
-
-	def goal_cb(self, p):
-		self.final_goal = [p.pose.position.x, p.pose.position.y]
-		self.goal = self.final_goal
 
 	def station_keeping_cb(self, req):
 		if req.data == True:
@@ -261,6 +282,30 @@ class Robot_PID():
 		self.ang_station_control.setKi(Ki)
 		self.ang_station_control.setKd(Kd)
 		return config
+
+	def publish_lookahead(self, robot, lookahead):
+		marker = Marker()
+		marker.header.frame_id = "/map"
+		marker.header.stamp = rospy.Time.now()
+		marker.ns = "pure_pursuit"
+		marker.type = marker.LINE_STRIP
+		marker.action = marker.ADD
+		wp = Point()
+		wp.x, wp.y = robot[:2]
+		wp.z = 0
+		marker.points.append(wp)
+		wp = Point()
+		wp.x, wp.y = lookahead[0], lookahead[1]
+		wp.z = 0
+		marker.points.append(wp)
+		marker.id = 0
+		marker.scale.x = 0.2
+		marker.scale.y = 0.2
+		marker.scale.z = 0.2
+		marker.color.a = 1.0
+		marker.color.b = 1.0
+		marker.color.g = 1.0
+		self.pub_lookahead.publish(marker)
 
 if __name__ == '__main__':
 	rospy.init_node('PID_control')
